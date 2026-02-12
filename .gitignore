@@ -210,3 +210,5 @@ __marimo__/
 # Test files and encrypted outputs
 test_file.txt
 enc_*.txt
+secure_keys
+enc_malicious.exe
