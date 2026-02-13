@@ -68,14 +68,21 @@ async def get_api_key(api_key: str = Depends(api_key_header)):
 # --- Middleware: Rate Limiting ---
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # EXCEPTION: Allow documentation and openapi schema to bypass rate limiting
+    # This prevents the UI from breaking due to concurrent browser requests.
+    if request.url.path in ["/docs", "/openapi.json", "/redoc"]:
+        return await call_next(request)
+
     client_ip = request.client.host
     now = time.time()
+    
     if client_ip in request_history and now - request_history[client_ip] < 1:
-        logger.warning(f"RATE_LIMIT_EXCEEDED | IP: {client_ip}")
+        logger.warning(f"RATE_LIMIT_EXCEEDED | IP: {client_ip} | Path: {request.url.path}")
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded. Try again in 1s."}
         )
+        
     request_history[client_ip] = now
     return await call_next(request)
 
