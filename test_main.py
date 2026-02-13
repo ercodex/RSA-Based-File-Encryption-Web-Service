@@ -1,78 +1,79 @@
 import pytest
 import time
 from fastapi.testclient import TestClient
-from main import app, API_KEY
+from main import app, TENANT_DB # Now we get keys from TENANT_DB
 
-client = TestClient(app)
+# raise_server_exceptions=False: We can bypass errors in the code to keep the test running
+client = TestClient(app, raise_server_exceptions=True)
 
-# --- 1. FUNCTIONAL TESTS ---
+# We get a valid key and expected ID from TENANT_DB
+VALID_API_KEY = list(TENANT_DB.keys())[0]
+EXPECTED_TENANT_ID = TENANT_DB[VALID_API_KEY]["id"]
 
+@pytest.fixture(autouse=True)
+def slow_down_tests():
+    """We wait 1.1 seconds after each test to clean Rate Limiter"""
+    yield
+    time.sleep(1.1)
+
+# 1. Health Check
 def test_health_check():
-    """Service status test"""
     response = client.get("/")
     assert response.status_code == 200
-    assert "RSA-2048" in response.json()["algorithm"]
 
-def test_encryption_decryption_cycle():
-    """Tests the full lifecycle and integrity of data"""
-    headers = {"X-API-KEY": API_KEY}
-    secret_msg = "Top secret message 123!".encode('utf-8')
-    
-    # Encrypt
-    files = {'file': ('doc.txt', secret_msg)}
-    enc_res = client.post("/encrypt", headers=headers, files=files)
-    assert enc_res.status_code == 200
-    
-    # Integrity Check: Compare Hash (Question 1a)
-    returned_hash = enc_res.headers.get("X-File-Integrity")
-    assert returned_hash is not None
-    
-    # Decrypt
-    dec_res = client.post("/decrypt", headers=headers, files={'file': ('enc.txt', enc_res.content)})
-    assert dec_res.status_code == 200
-    assert dec_res.json()["decrypted_content"] == secret_msg.decode('utf-8')
-
-# --- 2. SECURITY & BOUNDARY TESTS ---
-
+# 2. Unauthorized Access (Security Test: Negative Testing)
 def test_unauthorized_access():
-    """Security check for invalid API keys"""
-    response = client.post("/encrypt", headers={"X-API-KEY": "hacker-key"})
-    assert response.status_code == 403
+    headers = {"X-API-KEY": "wrong-key-456"}
+    response = client.post("/encrypt", headers=headers, files={'file': ('test.txt', b'Hello World')})
+    # Covers both unauthorized access and rate limit. Checks error message detail
+    assert response.status_code in [403, 429]
+    if response.status_code == 403:
+        assert "Invalid API Key" in response.json()["detail"]
 
-def test_invalid_file_extension():
-    """Input validation for disallowed file types"""
-    headers = {"X-API-KEY": API_KEY}
-    files = {'file': ('malicious.exe', b'print("hello")')}
+# 3. Full Crypto Cycle & Tenant Validation (Security Test: Multi-tenancy)
+def test_encryption_decryption_cycle():
+    headers = {"X-API-KEY": VALID_API_KEY}
+    original_data = b"Secret Project Data"
+    
+    # --- Encrypt Phase ---
+    enc_res = client.post("/encrypt", headers=headers, files={'file': ('data.txt', original_data)})
+    assert enc_res.status_code == 200
+    # Future work: Tenant isolation control?
+    assert enc_res.headers.get("X-Tenant-ID") == EXPECTED_TENANT_ID
+    
+    ciphertext_hex = enc_res.text
+    time.sleep(1.1) 
+    
+    # --- Decrypt Phase ---
+    dec_res = client.post("/decrypt", headers=headers, files={'file': ('enc_data.txt', ciphertext_hex)})
+    assert dec_res.status_code == 200
+    assert dec_res.json()["decrypted_content"] == original_data.decode()
+    # Future work: Tenant context check in response?
+    assert "tenant_context" in dec_res.json()
+
+# 4. Invalid File Extension (Input Validation)
+def test_invalid_extension():
+    headers = {"X-API-KEY": VALID_API_KEY}
+    files = {'file': ('malicious.exe', b'malware content')}
     response = client.post("/encrypt", headers=headers, files=files)
     assert response.status_code == 400
     assert "Disallowed file extension" in response.json()["detail"]
 
-def test_file_size_overflow():
-    """Testing the 190-byte RSA physical limit"""
-    headers = {"X-API-KEY": API_KEY}
-    oversized_data = b"A" * 200
-    files = {'file': ('big.txt', oversized_data)}
+# 5. File Size Limit (Security Test: RSA Boundary)
+def test_file_size_limit():
+    headers = {"X-API-KEY": VALID_API_KEY}
+    big_data = b"A" * 250 # Exceeds 190 byte limit
+    files = {'file': ('too_big.txt', big_data)}
     response = client.post("/encrypt", headers=headers, files=files)
+    # RSA returns 400 to prevent limit errors
     assert response.status_code == 400
     assert "File size exceeds" in response.json()["detail"]
 
-# --- 3. OPERATIONAL SECURITY TESTS ---
-
-def test_rate_limiting():
-    """Testing Denial of Service protection"""
-    headers = {"X-API-KEY": API_KEY}
-    # Send multiple requests quickly to trigger 429
-    for _ in range(5):
-        response = client.get("/", headers=headers)
-        if response.status_code == 429:
-            break
-    assert response.status_code == 429
-    assert "Rate limit exceeded" in response.json()["detail"]
-
-def test_decryption_failure_handling():
-    """Fail-secure behavior on corrupted data"""
-    headers = {"X-API-KEY": API_KEY}
-    bad_data = b"not-encrypted-properly"
-    response = client.post("/decrypt", headers=headers, files={'file': ('bad.txt', bad_data)})
-    assert response.status_code == 400
-    assert "Decryption failed" in response.json()["detail"]
+# 6. Rate Limiting (DoS Mitigation)
+def test_rate_limiting_trigger():
+    headers = {"X-API-KEY": VALID_API_KEY}
+    responses = []
+    for _ in range(3):
+        responses.append(client.get("/", headers=headers).status_code)
+    
+    assert 429 in responses

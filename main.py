@@ -1,119 +1,169 @@
 import os
-import logging
 import time
-from fastapi import FastAPI, UploadFile, File, HTTPException, Security, Request
+import secrets 
+import hashlib
+from typing import Dict
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from fastapi.responses import FileResponse
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 
-# --- LOGGING & CONFIG ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("SecureCryptoService")
+# --- API Initialization ---
+app = FastAPI(
+    title="Bespoke RSA Encryption Service",
+    description="A secure web service for RSA-2048 encryption.",
+    version="1.0.0"
+)
 
-app = FastAPI(title="Hardened RSA Encryption Service")
+# --- Configuration ---
+API_KEY = "super-secret-key-123"
+API_KEY_NAME = "X-API-KEY"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-API_KEY = "secure-assignment-key-2025"
-api_key_header = APIKeyHeader(name="X-API-KEY")
+KEY_DIR = "secure_keys"
+PRIVATE_KEY_PATH = os.path.join(KEY_DIR, "private.pem")
+PUBLIC_KEY_PATH = os.path.join(KEY_DIR, "public.pem")
 
-# Simple In-memory Rate Limiting (Question 2: DoS Mitigation)
-request_history = {}
+# Rate limiting storage
+request_history: Dict[str, float] = {}
 
-# --- KEY MANAGEMENT (Question 7b & 8a) ---
-KEY_FOLDER = "secure_keys"
-PRIV_KEY_PATH = os.path.join(KEY_FOLDER, "private_key.pem")
+if not os.path.exists(KEY_DIR):
+    os.makedirs(KEY_DIR)
 
-if not os.path.exists(KEY_FOLDER):
-    os.makedirs(KEY_FOLDER)
+# --- Multi-Tenant Demo Configuration ---
+# Just a demo!
+TENANT_DB = {
+    "super-secret-key-123": {"id": "tenant_001", "name": "Company_A"},
+    "other-secret-key-456": {"id": "tenant_002", "name": "Company_B"}
+}
 
-def load_or_generate_keys():
-    """Ensures cryptographic agility and persistence"""
-    if os.path.exists(PRIV_KEY_PATH):
-        with open(PRIV_KEY_PATH, "rb") as k:
-            priv = serialization.load_pem_private_key(k.read(), password=None)
-            logger.info("Existing RSA keys loaded from disk.")
-    else:
-        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        with open(PRIV_KEY_PATH, "wb") as f:
-            f.write(priv.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            ))
-        logger.info("New RSA keys generated and saved to disk.")
-    return priv, priv.public_key()
 
-private_key, public_key = load_or_generate_keys()
+async def get_api_key(api_key: str = Depends(api_key_header)):
+    # By using secrets.compare_digest, we make sure each comparison ends at the same time.
+    valid_key_found = False
+    current_tenant = None
+    
+    for key, context in TENANT_DB.items():
+        if secrets.compare_digest(api_key, key):
+            valid_key_found = True
+            current_tenant = context
+            break
+            
+    if not valid_key_found:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return current_tenant
 
-# --- SECURITY MIDDLEWARE ---
+# --- Middleware: Rate Limiting ---
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host
     now = time.time()
     if client_ip in request_history and now - request_history[client_ip] < 1:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again in 1s.")
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again in 1s."}
+        )
     request_history[client_ip] = now
     return await call_next(request)
 
-def get_api_key(api_key: str = Security(api_key_header)):
-    if api_key != API_KEY:
-        logger.warning(f"Unauthorized access attempt from IP: {api_key}")
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
-    return api_key
+# --- Key Management ---
+def load_or_generate_keys():
+    """Loads existing keys or generates new ones if not present."""
+    if os.path.exists(PRIVATE_KEY_PATH):
+        with open(PRIVATE_KEY_PATH, "rb") as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=None)
+        public_key = private_key.public_key()
+    else:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_key = private_key.public_key()
+        with open(PRIVATE_KEY_PATH, "wb") as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        with open(PUBLIC_KEY_PATH, "wb") as f:
+            f.write(public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ))
+    return private_key, public_key
 
-# --- ENDPOINTS ---
+private_key, public_key = load_or_generate_keys()
+
+# --- Endpoints ---
+
 @app.get("/")
-def status():
-    return {"status": "Operational", "algorithm": "RSA-2048/OAEP"}
+async def health_check():
+    return {"status": "online", "algorithm": "RSA-2048 / OAEP"}
 
-@app.post("/encrypt", dependencies=[Security(get_api_key)])
-async def encrypt(file: UploadFile = File(...)):
-    # Input Validation (Question 5a)
-    if not file.filename.endswith(('.txt', '.pdf', '.docx')):
-        raise HTTPException(status_code=400, detail="Disallowed file extension.")
+@app.post("/encrypt", tags=["Crypto Operations"])
+async def encrypt_file(file: UploadFile = File(...), tenant: dict = Depends(get_api_key)):
+    """
+    Encrypts a file and identifies the tenant making the request.
+    """
+    # Input Validation: Extension
+    allowed_exts = {".txt", ".pdf", ".docx"}
+    _, ext = os.path.splitext(file.filename)
+    if ext.lower() not in allowed_exts:
+        raise HTTPException(status_code=400, detail=f"Disallowed file extension: {ext}")
 
-    data = await file.read()
-    if len(data) > 190: # RSA physical limit for 2048-bit with OAEP
-        raise HTTPException(status_code=400, detail="File size exceeds RSA-2048 block limit.")
+    content = await file.read()
+    
+    # Input Validation: Size
+    if len(content) > 190:
+        raise HTTPException(status_code=400, detail="File size exceeds RSA 2048-bit capacity (max ~190 bytes).")
 
-    try:
-        # Integrity check: Hash before encryption (Question 3b)
-        digest = hashes.Hash(hashes.SHA256())
-        digest.update(data)
-        file_hash = digest.finalize().hex()
+    # --- MULTI-TENANT LOGIC (Demo) ---
+    # We use tenants here. As a demo, we print them out (log simulation)
+    print(f"Action: Encryption | Tenant: {tenant['name']} (ID: {tenant['id']})")
 
-        ciphertext = public_key.encrypt(
-            data,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
+    # Encryption Process
+    ciphertext = public_key.encrypt(
+        content,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
         )
+    )
+    
+    file_hash = hashlib.sha256(content).hexdigest()
+    
+    return Response(
+        content=ciphertext.hex(), 
+        media_type="text/plain",
+        headers={
+            "X-File-Integrity": file_hash,
+            "X-Tenant-ID": tenant['id'] # We add tenant information to header
+        }
+    )
+@app.post("/decrypt", tags=["Crypto Operations"])
+async def decrypt_file(file: UploadFile = File(...), tenant: dict = Depends(get_api_key)):
+    """
+    Decrypts a hex-encoded file and logs the tenant identity.
+    """
+    try:
+        # Logging the attempt
+        print(f"Action: Decryption | Tenant: {tenant['name']} (ID: {tenant['id']})")
         
-        enc_name = f"enc_{file.filename}"
-        with open(enc_name, "wb") as f:
-            f.write(ciphertext)
-
-        logger.info(f"File {file.filename} encrypted. Hash: {file_hash}")
-        return FileResponse(path=enc_name, filename=enc_name, headers={"X-File-Integrity": file_hash})
-    except Exception as e:
-        logger.error(f"Internal Crypto Error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Encryption failure.")
-
-@app.post("/decrypt", dependencies=[Security(get_api_key)])
-async def decrypt(file: UploadFile = File(...)):
-    enc_data = await file.read()
-    try:
-        decrypted = private_key.decrypt(
-            enc_data,
+        hex_content = await file.read()
+        # strip() handles potential whitespace/newlines
+        ciphertext = bytes.fromhex(hex_content.decode('utf-8').strip())
+        
+        plaintext = private_key.decrypt(
+            ciphertext,
             padding.OAEP(
                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
                 algorithm=hashes.SHA256(),
                 label=None
             )
         )
-        return {"decrypted_content": decrypted.decode('utf-8')}
+        return {
+            "decrypted_content": plaintext.decode('utf-8'),
+            "tenant_context": tenant['name'] # Confirms identity in response
+        }
     except Exception:
-        # Fail-secure: Generic error (Question 3b)
-        raise HTTPException(status_code=400, detail="Decryption failed. Invalid data or key.")
+        # Security Note: We provide a generic error to prevent side-channel attacks
+        raise HTTPException(status_code=400, detail="Decryption failed. Invalid file or corrupted data.")
