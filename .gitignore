@@ -135,7 +135,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+# .env # We need this, sorry...
 .envrc
 .venv
 env/
@@ -213,3 +213,6 @@ enc_*.txt
 secure_keys
 enc_malicious.exe
 enc_*
+requirements.in
+requirements_hash.txt
+sbom.json

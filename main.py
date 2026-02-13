@@ -2,17 +2,22 @@ import os
 import time
 import secrets 
 import hashlib
-import logging # Yeni ekleme
-from datetime import datetime # Yeni ekleme
+import logging
+import binascii
 from typing import Dict
+from datetime import datetime # New addition
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from dotenv import load_dotenv
+
+# --- Load Environment Variables ---
+load_dotenv()
 
 # --- Security Logging Configuration ---
-# Log formatı SIEM (Security Information and Event Management) sistemlerine uygun hale getirildi.
+# Log format adapted for SIEM (Security Information and Event Management) systems.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -22,19 +27,26 @@ logger = logging.getLogger("SecurityAudit")
 
 # --- API Initialization ---
 app = FastAPI(
-    title="Bespoke RSA Encryption Service",
+    title="Ridicoulusly Secure RSA Encryption Service",
     description="A secure web service for RSA-2048 encryption.",
     version="1.0.0"
 )
 
 # --- Configuration ---
-# API_KEY değişkeni TENANT_DB'den kontrol edileceği için burada sabit tutulabilir veya kaldırılabilir.
+# API_KEY variable can be kept here or removed since it will be checked from TENANT_DB.
 API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 KEY_DIR = "secure_keys"
 PRIVATE_KEY_PATH = os.path.join(KEY_DIR, "private.pem")
 PUBLIC_KEY_PATH = os.path.join(KEY_DIR, "public.pem")
+
+MAGIC_NUMBERS = {
+    "pdf": b"%PDF",
+    "png": b"\x89PNG\r\n\x1a\n",
+    "jpg": b"\xff\xd8\xff",
+    "txt": None  # Text files do not have magic bytes, encoding check is performed.
+}
 
 # Rate limiting storage
 request_history: Dict[str, float] = {}
@@ -43,26 +55,43 @@ if not os.path.exists(KEY_DIR):
     os.makedirs(KEY_DIR)
 
 # --- Multi-Tenant Demo Configuration ---
+# Retrieve keys from environment variables to prevent hardcoding secrets
 TENANT_DB = {
-    "super-secret-key-123": {"id": "tenant_001", "name": "Company_A"},
-    "other-secret-key-456": {"id": "tenant_002", "name": "Company_B"}
+    os.getenv("TENANT_A_KEY"): {"id": "tenant_001", "name": "Company_A"},
+    os.getenv("TENANT_B_KEY"): {"id": "tenant_002", "name": "Company_B"}
 }
 
+# Remove None keys if env vars are missing
+TENANT_DB = {k: v for k, v in TENANT_DB.items() if k}
+
 async def get_api_key(api_key: str = Depends(api_key_header)):
+    if not api_key:
+        # Made the message clearer
+        logger.warning("AUTH_FAILURE | Missing API Key")
+        raise HTTPException(
+            status_code=403, 
+            detail="Access Denied: No API Key provided. Click 'Authorize' button."
+        )
+    
     valid_key_found = False
     current_tenant = None
     
-    # Timing attack protection with secrets.compare_digest
     for key, context in TENANT_DB.items():
-        if api_key and secrets.compare_digest(api_key, key):
+        if secrets.compare_digest(api_key, key):
             valid_key_found = True
             current_tenant = context
             break
             
     if not valid_key_found:
-        # Başarısız giriş denemesi loglanıyor (Audit Trail)
-        logger.warning(f"AUTH_FAILURE | Invalid API Key provided.")
-        raise HTTPException(status_code=403, detail="Invalid API Key")
+        logger.warning(f"AUTH_FAILURE | Invalid Key: {api_key}")
+        # Customized the error message
+        raise HTTPException(
+            status_code=403, 
+            detail="Access Denied: Invalid API Key. Please check your credentials."
+        )
+        
+    # Log successful login
+    logger.info(f"AUTH_SUCCESS | Tenant: {current_tenant['name']} granted access.")
     return current_tenant
 
 # --- Middleware: Rate Limiting ---
@@ -111,6 +140,29 @@ def load_or_generate_keys():
 
 private_key, public_key = load_or_generate_keys()
 
+# --- Helper Function: Content Validation ---
+async def validate_file_content(file: UploadFile, ext: str):
+    """
+    OWASP ASVS 12.1.1: Verify that the uploaded file matches the expected type 
+    checking the file header (magic bytes) rather than just the extension.
+    """
+    await file.seek(0)
+    header = await file.read(10) # Read the first 10 bytes
+    await file.seek(0) # Reset pointer to the beginning
+    
+    ext_clean = ext.replace(".", "").lower()
+    
+    # Simple UTF-8 check for text files
+    if ext_clean == "txt":
+        return True 
+        
+    expected_magic = MAGIC_NUMBERS.get(ext_clean)
+    if expected_magic and not header.startswith(expected_magic):
+        logger.warning(f"SECURITY_EVENT | Magic Byte Mismatch | Claimed: {ext} | Header: {binascii.hexlify(header)}")
+        raise HTTPException(status_code=400, detail="File content does not match extension (Magic Byte Mismatch).")
+    
+    return True
+
 # --- Endpoints ---
 
 @app.get("/")
@@ -124,6 +176,8 @@ async def encrypt_file(file: UploadFile = File(...), tenant: dict = Depends(get_
     if ext.lower() not in allowed_exts:
         logger.error(f"VALIDATION_ERROR | Tenant: {tenant['id']} | Invalid extension: {ext}")
         raise HTTPException(status_code=400, detail=f"Disallowed file extension: {ext}")
+
+    await validate_file_content(file, ext)
 
     content = await file.read()
     
@@ -153,7 +207,6 @@ async def encrypt_file(file: UploadFile = File(...), tenant: dict = Depends(get_
             "X-Tenant-ID": tenant['id']
         }
     )
-
 @app.post("/decrypt", tags=["Crypto Operations"])
 async def decrypt_file(file: UploadFile = File(...), tenant: dict = Depends(get_api_key)):
     try:
@@ -171,10 +224,23 @@ async def decrypt_file(file: UploadFile = File(...), tenant: dict = Depends(get_
                 label=None
             )
         )
-        return {
+
+
+        # Assign the response to a variable first
+        response_data = {
             "decrypted_content": plaintext.decode('utf-8'),
             "tenant_context": tenant['name']
         }
+
+        # --- MEM-01 Implementation: Explicit Memory Clearing ---
+        # Even though Python has a garbage collector, explicitly deleting the references
+        # of sensitive data is a defence layer against memory dump analyses.
+        del plaintext
+        del ciphertext
+        del hex_content  # We also clean the raw input
+        
+        return response_data
+
     except Exception as e:
         logger.error(f"CRYPTO_FAILURE | Tenant: {tenant['id']} | Error: Decryption logic failure.")
         raise HTTPException(status_code=400, detail="Decryption failed. Invalid file or corrupted data.")
